@@ -16,6 +16,37 @@ bool decode_static_path(const std::string &encoded, std::string &decoded) {
   return vise::url_decode(encoded, decoded);
 }
 
+bool safe_project_component(const std::string &name) {
+  if(name.empty() || name == "." || name == "..") return false;
+  for(unsigned char c : name) {
+    if(c < 32 || c == 127 || c == '/' || c == '\\' || c == ':') return false;
+  }
+#ifdef _WIN32
+  if(name.back() == '.' || name.back() == ' ' || name.find_first_of("<>\"|?*") != std::string::npos)
+    return false;
+  // Win32 reserves device names even with extensions (including COM/LPT
+  // followed by the recognized superscript digits). Keep Unicode names valid.
+  try {
+    std::wstring stem = boost::filesystem::path(name).wstring();
+    stem = stem.substr(0, stem.find(L'.'));
+    for(auto &c : stem) if(c >= L'a' && c <= L'z') c -= L'a' - L'A';
+    if(stem == L"CON" || stem == L"PRN" || stem == L"AUX" || stem == L"NUL") return false;
+    if(stem.size() == 4 && (stem.substr(0, 3) == L"COM" || stem.substr(0, 3) == L"LPT") &&
+       ((stem[3] >= L'1' && stem[3] <= L'9') || stem[3] == L'\u00b9' ||
+        stem[3] == L'\u00b2' || stem[3] == L'\u00b3')) return false;
+  } catch(const std::exception &) {
+    return false;
+  }
+#endif
+  return true;
+}
+
+bool safe_project_uri_component(const std::string &encoded) {
+  std::string decoded;
+  return decode_static_path(encoded, decoded) && safe_project_component(encoded) &&
+         safe_project_component(decoded);
+}
+
 bool contained_static_file(const boost::filesystem::path &directory,
                            const boost::filesystem::path &relative,
                            boost::filesystem::path &resolved) {
@@ -79,6 +110,13 @@ void project_manager::process_http_request(http_request const &request,
   std::vector<std::string> uri;
   std::unordered_map<std::string, std::string> param;
   vise::decompose_uri(request_uri_without_ns, uri, param);
+
+  // Validate the project selector before it can choose a filesystem store,
+  // create/load project directories, or enter a project-specific handler.
+  if(uri.size() > 2 && !safe_project_uri_component(uri[1])) {
+    response.set_status(404);
+    return;
+  }
 
   #ifdef _NDEBUG
   std::ostringstream ss;

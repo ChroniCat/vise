@@ -34,10 +34,20 @@ vise::http_response get(vise::project_manager &manager, const std::string &path,
   manager.process_http_request(request, response);
   return response;
 }
+vise::http_response project_request(vise::project_manager &manager, const std::string &method,
+                                   const std::string &path) {
+  vise::http_request request;
+  request.parse(method + " /api/" + path + " HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
+  vise::http_response response;
+  manager.process_http_request(request, response);
+  return response;
+}
 void deny(vise::project_manager &manager, const std::string &path) {
   const auto response = get(manager, path);
   require(response.d_status_code == 404 && response.d_payload.find(sentinel) == std::string::npos,
-          "escaped resource must be unavailable: " + path);
+          "escaped resource must be unavailable: " + path + " (status=" +
+          std::to_string(response.d_status_code) + ", outside sentinel=" +
+          (response.d_payload.find(sentinel) == std::string::npos ? "absent" : "present") + ")");
 }
 void allow(vise::project_manager &manager, const std::string &path, const std::string &payload) {
   const auto response = get(manager, path);
@@ -55,11 +65,13 @@ int main(int argc, char **argv) {
   const fs::path root = fs::temp_directory_path() / fs::unique_path("vise-static-path-%%%%-%%%%");
   try {
     Magick::InitializeMagick(argv[0]);
-    const fs::path www = root / "www", gallery = root / "gallery";
+    const fs::path www = root / "www", projects = root / "projects", gallery = projects / "gallery";
     write(root / "private.txt", sentinel);
     write(root / "www-sibling/private.txt", sentinel);
     write(www / "asset.js", "global asset");
     write(www / "nested/asset space.js", "nested global asset");
+    write(root / "app/private.js", sentinel);
+    write(projects / "app/private.js", sentinel);
     write(gallery / "private.txt", sentinel);
     for(const char *store : {"app", "image", "image_src", "image_small"}) {
       write(gallery / store / "asset.js", std::string("public ") + store);
@@ -70,18 +82,48 @@ int main(int argc, char **argv) {
     symlink(root / "private.txt", www / "escape.js");
     symlink(www / "asset.js", www / "inside.js");
     symlink(root / "www-sibling", www / "escape-directory", true);
-    fs::create_directories(root / "fallback");
-    fs::create_directories(root / "coverless/image");
-    symlink(root / "private.txt", root / "coverless/image/escape.jpg");
+    fs::create_directories(projects / "fallback");
+    fs::create_directories(projects / "coverless/image");
+    symlink(root / "private.txt", projects / "coverless/image/escape.jpg");
+    write(projects / "custom.project/app/asset.js", "dotted project asset");
+#ifdef _WIN32
+    const std::string unicode_name = fs::path(L"\u6d4b\u8bd5").string();
+#else
+    const std::string unicode_name = "\xe6\xb5\x8b\xe8\xaf\x95";
+#endif
+    write(projects / unicode_name / "app/asset.js", "Unicode project asset");
 
     std::map<std::string, std::string> conf;
     vise::init_default_vise_settings(conf);
     conf["http-namespace"] = "/api/";
     conf["http-www-dir"] = www.string();
-    conf["vise-project-dir"] = root.string();
+    conf["vise-project-dir"] = projects.string();
     conf["vise-asset-dir"] = (root / "assets").string();
     {
       vise::project_manager manager(conf);
+      // Per-asset containment must not first select the project-store parent.
+      deny(manager, "../app/private.js");
+      deny(manager, "./app/private.js");
+      for(const char *project : {"", "%2e", "%2e%2e", "%2f", "%5c", "bad%2fname",
+                                 "bad%5cname", "C%3a", "bad%00name", "bad%1fname", "bad%7fname", "%2g"}) {
+        for(const char *method : {"GET", "POST", "PUT", "DELETE"}) {
+          const auto response = project_request(manager, method, std::string(project) + "/app/private.js");
+          require(response.d_status_code == 404 && response.d_payload.find(sentinel) == std::string::npos,
+                  "unsafe project selector must be rejected before routing");
+        }
+      }
+#ifdef _WIN32
+      for(const char *project : {"CON", "NUL.jpg", "COM1", "LPT9.ext", "bad.", "bad%20", "bad|name"})
+        deny(manager, std::string(project) + "/app/private.js");
+#endif
+      require(!fs::exists(root / "data") && !fs::exists(root / "image") &&
+              !fs::exists(root / "image_src") && !fs::exists(root / "tmp") &&
+              !fs::exists(projects / "data") && !fs::exists(projects / "image"),
+              "invalid project names must not create parent project directories");
+      require(!manager.project_is_loaded("..") && !manager.project_is_loaded("."),
+              "invalid project names must not be loaded");
+      allow(manager, "custom.project/app/asset.js", "dotted project asset");
+      allow(manager, unicode_name + "/app/asset.js", "Unicode project asset");
       // Stock VISE reads this sentinel through the app store's parent path.
       deny(manager, "gallery/app/%2e%2e%2fprivate.txt");
       allow(manager, "asset.js", "global asset");
